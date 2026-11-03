@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>桌面宠物</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    /* 两层图片叠在一起，通过透明度和缩放做平滑过渡 */
+    #pet-stage {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+      -webkit-app-region: no-drag;
+    }
+
+    #pet-stage:active {
+      cursor: grabbing;
+    }
+
+    /* set 状态下让外层容器上下浮动；内层 img 的 scale 不受影响 */
+    #pet-container {
+      position: absolute;
+      inset: 0;
+      transform: translateY(0);
+      pointer-events: none;
+      will-change: transform;
+    }
+
+    #pet-container.is-floating {
+      animation: float 3s ease-in-out infinite;
+    }
+
+    @keyframes float {
+      0% {
+        transform: translateY(0);
+      }
+      50% {
+        transform: translateY(-8px);
+      }
+      100% {
+        transform: translateY(0);
+      }
+    }
+
+    /* 点击反馈：包裹两层图片，避免和各个状态自己的缩放冲突 */
+    #pet-visual {
+      position: absolute;
+      inset: 0;
+      transform: scale(1);
+      transform-origin: center center;
+      transition: transform 0.12s ease-out;
+      pointer-events: none;
+      will-change: transform;
+    }
+
+    #pet-visual.is-pressed {
+      transform: scale(0.95);
+    }
+
+    .pet-layer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      opacity: 0;
+      transform: scale(1);
+      transform-origin: center center;
+      transition: transform 0.3s ease-in-out, opacity 240ms ease-in-out;
+      -webkit-user-drag: none;
+      user-select: none;
+      pointer-events: none;
+      will-change: opacity, transform;
+    }
+
+    .pet-layer.is-visible {
+      opacity: 1;
+    }
+
+    /* 三个状态的视觉缩放，数值都在这里调 */
+    .pet-layer.scale-set {
+      transform: scale(0.65);
+    }
+
+    .pet-layer.scale-walk {
+      transform: scale(1.1);
+    }
+
+    .pet-layer.scale-idle {
+      transform: scale(0.85);
+    }
+
+    /* set 状态点击时显示的台词气泡 */
+    #speech-bubble {
+      position: absolute;
+      top: 6px;
+      left: 50%;
+      z-index: 10;
+      max-width: calc(100% - 16px);
+      padding: 6px 10px;
+      border: 1px solid rgba(120, 120, 120, 0.18);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      color: #3a3a3a;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: nowrap;
+      text-align: center;
+      opacity: 0;
+      pointer-events: none;
+      transform: translate(-50%, -6px) scale(0.96);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+
+    #speech-bubble.is-visible {
+      opacity: 1;
+      transform: translate(-50%, 0) scale(1);
+    }
+
+    #speech-bubble::after {
+      content: '';
+      position: absolute;
+      left: 50%;
+      bottom: -5px;
+      width: 9px;
+      height: 9px;
+      border-right: 1px solid rgba(120, 120, 120, 0.18);
+      border-bottom: 1px solid rgba(120, 120, 120, 0.18);
+      background: rgba(255, 255, 255, 0.96);
+      transform: translateX(-50%) rotate(45deg);
+    }
+  </style>
+</head>
+<body>
+  <div id="pet-stage">
+    <div id="pet-container">
+      <div id="pet-visual">
+        <img
+          id="pet-layer-a"
+          class="pet-layer is-visible scale-idle"
+          src="assets/idle.gif"
+          alt="桌宠"
+          draggable="false"
+        >
+        <img
+          id="pet-layer-b"
+          class="pet-layer scale-idle"
+          src="assets/idle.gif"
+          alt=""
+          draggable="false"
+        >
+      </div>
+    </div>
+    <div id="speech-bubble" role="status" aria-live="polite"></div>
+  </div>
+
+  <script>
+    const { ipcRenderer } = require('electron')
+
+    const stage = document.getElementById('pet-stage')
+    const petContainer = document.getElementById('pet-container')
+    const petVisual = document.getElementById('pet-visual')
+    const speechBubble = document.getElementById('speech-bubble')
+    const voicePlayer = new Audio()
+    voicePlayer.preload = 'auto'
+    const layers = [
+      document.getElementById('pet-layer-a'),
+      document.getElementById('pet-layer-b')
+    ]
+
+    const GIFS = {
+      set: 'assets/set.gif',
+      idle: 'assets/idle.gif',
+      walk: 'assets/walk.gif'
+    }
+
+    // 每个状态对应的缩放类
+    const SCALE_CLASSES = {
+      set: 'scale-set',
+      idle: 'scale-idle',
+      walk: 'scale-walk'
+    }
+
+    const ALL_SCALE_CLASSES = Object.values(SCALE_CLASSES)
+
+    function setLayerScale(layer, state) {
+      layer.classList.remove(...ALL_SCALE_CLASSES)
+      layer.classList.add(SCALE_CLASSES[state])
+    }
+
+    // 预加载三个 GIF，避免第一次切换时闪空
+    const preloadedImages = Object.values(GIFS).map((src) => {
+      const image = new Image()
+      image.src = src
+      return image
+    })
+
+    const SPEECH_DURATION = 3_000
+    let speechTimer = null
+
+    function hideSpeech() {
+      if (speechTimer !== null) {
+        clearTimeout(speechTimer)
+        speechTimer = null
+      }
+
+      speechBubble.classList.remove('is-visible')
+    }
+
+    function showSpeech(text) {
+      if (!text) {
+        return
+      }
+
+      speechBubble.textContent = text
+      speechBubble.classList.add('is-visible')
+
+      clearTimeout(speechTimer)
+      speechTimer = setTimeout(() => {
+        speechTimer = null
+        speechBubble.classList.remove('is-visible')
+      }, SPEECH_DURATION)
+    }
+
+    function playVoice(src) {
+      if (!src) {
+        return
+      }
+
+      // 连续点击时先停掉上一句，保证每次只播放当前这一句
+      voicePlayer.pause()
+      voicePlayer.src = src
+
+      const playPromise = voicePlayer.play()
+
+      if (playPromise && typeof playPromise.catch === 'function') {
+        playPromise.catch((error) => {
+          // 快速连续点击时，上一句的 play() 可能会被中断，这是正常现象
+          if (error.name !== 'AbortError') {
+            console.warn('语音播放失败：', error)
+          }
+        })
+      }
+    }
+
+    let activeLayer = layers[0]
+    let currentState = 'idle'
+    let transitionToken = 0
+    let zIndex = 2
+
+    layers[0].style.zIndex = '2'
+    layers[1].style.zIndex = '1'
+    layers[0].classList.add('is-visible')
+    layers[1].classList.remove('is-visible')
+
+    function transitionTo(nextState) {
+      const src = GIFS[nextState]
+
+      if (!src || nextState === currentState) {
+        return
+      }
+
+      currentState = nextState
+
+      const nextLayer = activeLayer === layers[0] ? layers[1] : layers[0]
+      const token = ++transitionToken
+
+      const reveal = () => {
+        if (token !== transitionToken) {
+          return
+        }
+
+        requestAnimationFrame(() => {
+          if (token !== transitionToken) {
+            return
+          }
+
+          // 新图层放到最上面，透明淡入；旧图层同时淡出
+          nextLayer.style.zIndex = String(++zIndex)
+
+          // 两个图层同时切到目标缩放，让淡入淡出和缩放保持同步
+          setLayerScale(nextLayer, nextState)
+          setLayerScale(activeLayer, nextState)
+
+          nextLayer.classList.add('is-visible')
+          activeLayer.classList.remove('is-visible')
+          activeLayer = nextLayer
+        })
+      }
+
+      // 快速连续切换时，保证这一层先回到透明状态
+      nextLayer.classList.remove('is-visible')
+      nextLayer.src = src
+
+      if (nextLayer.complete && nextLayer.naturalWidth > 0) {
+        reveal()
+      } else {
+        nextLayer.addEventListener('load', reveal, { once: true })
+        nextLayer.addEventListener('error', reveal, { once: true })
+      }
+    }
+
+    // 主进程负责状态判断，渲染进程只负责平滑换图、浮动和显示台词
+    ipcRenderer.on('pet-state', (_event, state) => {
+      // 只有 set 状态开启上下浮动
+      petContainer.classList.toggle('is-floating', state === 'set')
+
+      transitionTo(state)
+
+      // 离开 set 状态时收起台词气泡
+      if (state !== 'set') {
+        hideSpeech()
+      }
+    })
+
+    // 主进程发来的随机台词 + 对应语音
+    ipcRenderer.on('pet-speak', (_event, speech) => {
+      if (!speech) {
+        return
+      }
+
+      const text = typeof speech === 'string' ? speech : speech.text
+      const voice = typeof speech === 'string' ? null : speech.voice
+
+      showSpeech(text)
+      playVoice(voice)
+    })
+
+    let isPressing = false
+
+    stage.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) {
+        return
+      }
+
+      event.preventDefault()
+
+      isPressing = true
+      petVisual.classList.add('is-pressed')
+      ipcRenderer.send('pet-drag-start')
+    })
+
+    window.addEventListener('mouseup', (event) => {
+      if (!isPressing || event.button !== 0) {
+        return
+      }
+
+      isPressing = false
+      petVisual.classList.remove('is-pressed')
+      ipcRenderer.send('pet-drag-end')
+    })
+
+    // 拖拽过程中窗口失焦时，通知主进程取消这次操作，避免状态卡住
+    window.addEventListener('blur', () => {
+      petVisual.classList.remove('is-pressed')
+
+      if (!isPressing) {
+        return
+      }
+
+      isPressing = false
+      ipcRenderer.send('pet-drag-end', { cancelled: true })
+    })
+
+    // 防止图片被浏览器原生拖拽
+    document.addEventListener('dragstart', (event) => {
+      event.preventDefault()
+    })
+
+    // 右键桌宠：阻止默认菜单，通知主进程弹出原生退出菜单
+    stage.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      ipcRenderer.send('pet-context-menu')
+    })
+  </script>
+</body>
+</html>
